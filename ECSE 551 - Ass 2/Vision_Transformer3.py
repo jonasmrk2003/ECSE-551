@@ -318,3 +318,7 @@ torch.save(
     "Vision_Transformer_Metrics.pt"
 )
 # %%
+
+# save the trained model weights
+torch.save(model.state_dict(), "VIT3_weights.pt")
+print("Saved Vision Transformer 3 weights as VIT3_weights.pt")
