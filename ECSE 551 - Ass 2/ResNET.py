@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim 
 from helper_functions import *
+from pathlib import Path
 
 
 class ResNET_Block(nn.Module):
@@ -114,37 +115,33 @@ class ResNet_32(nn.Module):
 
 
 
-# # Hyperparameters
-batch_size = 32
-weight_decay = 0.001
-num_epochs = 25
-learning_rate = 0.01
-label_smoothing = 0.0
+if __name__ == "__main__":
+    # Hyperparameters
+    batch_size = 32
+    weight_decay = 0.001
+    num_epochs = 25
+    learning_rate = 0.01
+    label_smoothing = 0.0
+    seed = 42
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-model = ResNet_32(ResNET_block= ResNET_Block, n_layers = [3, 4, 6, 3], num_classes=10).to(device)
-criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = ResNet_32(ResNET_block=ResNET_Block, n_layers=[1, 1, 1, 1], num_classes=10).to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
+    train_loader, test_loader = load_data(
+        dataset_class=CustomImageDataset,
+        csv_file="train_labels.csv",
+        img_dir="train",
+        batch_size=batch_size,
+        augment=False,
+        train_ratio=0.7,
+        seed=seed,
+    )
 
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=0.001, momentum=0.9)
+    train_accs, test_accs, weights = train_model(
+        model, train_loader, test_loader, criterion, optimizer, device, num_epochs
+    )
 
-train_loader, test_loader = load_data(
-    dataset_class=CustomImageDataset,
-    csv_file='train_labels.csv',
-    img_dir='train',
-    batch_size=batch_size,
-    augment=False,
-    train_ratio=0.7,
-)
-# Optimizer
-# optimizer = optim.AdamW(
-#     model.parameters(),
-#     lr=learning_rate,
-#     betas=(0.9, 0.999),
-#     eps=1e-8,
-#     weight_decay= weight_decay,
-#     momentum=0.9
-# )
-optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay = 0.001, momentum = 0.9)  
-train_accs, test_accs, weights = train_model(
-    model, train_loader, test_loader, criterion, optimizer, device, num_epochs
-)
+    torch.save(model.state_dict(), "ResNet9.pt")
+    print("Saved ResNet weights to ResNet9.pt")

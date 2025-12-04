@@ -7,6 +7,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from warmup_scheduler import GradualWarmupScheduler
+import copy
+from pathlib import Path
 
 
 class CustomImageDataset(Dataset):
@@ -164,133 +166,201 @@ class VisionTransformer(nn.Module):
 
 
 
-# Transformations for training (with augmentation)
-train_transform = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),    # random crop with padding
-    transforms.RandomHorizontalFlip(),       # horizontal flip
-    transforms.TrivialAugmentWide(),         # automatic augmentation
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.4914, 0.4822, 0.4465],      # CIFAR-10 mean
-        std=[0.2470, 0.2435, 0.2616]        # CIFAR-10 std
+def build_transforms(augment=True):
+    if augment:
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.TrivialAugmentWide(),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.4914, 0.4822, 0.4465],
+                std=[0.2470, 0.2435, 0.2616]
+            )
+        ])
+    else:
+        train_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.4914, 0.4822, 0.4465],
+                std=[0.2470, 0.2435, 0.2616]
+            )
+        ])
+
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.4914, 0.4822, 0.4465],
+            std=[0.2470, 0.2435, 0.2616]
+        )
+    ])
+    return train_transform, test_transform
+
+
+def load_dataloaders(
+    csv_file,
+    img_dir,
+    batch_size,
+    train_ratio,
+    val_ratio,
+    augment,
+    seed=42,
+    split_save_path=None,
+    split_load_path=None,
+):
+    train_t, test_t = build_transforms(augment=augment)
+    full_dataset = CustomImageDataset(csv_file=csv_file, img_dir=img_dir, transform=None)
+    if split_load_path and Path(split_load_path).exists():
+        saved = torch.load(split_load_path, map_location="cpu")
+        train_idx = saved.get("train_indices", [])
+        val_idx = saved.get("val_indices", [])
+        test_idx = saved.get("test_indices", [])
+        train_dataset = torch.utils.data.Subset(full_dataset, train_idx)
+        val_dataset = torch.utils.data.Subset(full_dataset, val_idx)
+        test_dataset = torch.utils.data.Subset(full_dataset, test_idx)
+    else:
+        train_size = int(train_ratio * len(full_dataset))
+        val_size = int(val_ratio * len(full_dataset))
+        test_size = len(full_dataset) - train_size - val_size
+        generator = torch.Generator().manual_seed(seed)
+        train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size, test_size], generator=generator
+        )
+        if split_save_path:
+            torch.save(
+                {
+                    "train_indices": train_dataset.indices,
+                    "val_indices": val_dataset.indices,
+                    "test_indices": test_dataset.indices,
+                },
+                split_save_path,
+            )
+    train_dataset.dataset.transform = train_t
+    val_dataset.dataset.transform = test_t
+    test_dataset.dataset.transform = test_t
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader, test_loader
+
+
+def make_optimizer(model, optimizer_name, lr, weight_decay, momentum=0.9):
+    name = optimizer_name.lower()
+    if name == "sgd":
+        return optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+    if name == "adam" or name == "adamw":
+        return optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=weight_decay
+        )
+    raise ValueError(f"Unknown optimizer {optimizer_name}")
+
+
+def train_one_vit(config):
+    """
+    Train one ViT config and save weights/metrics.
+    config keys: label, batch_size, weight_decay, dropout, heads, layers,
+    hidden_dim, mlp_ratio, lr, optimizer, epochs, train_ratio, augment, csv_file, img_dir
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    train_loader, val_loader, test_loader = load_dataloaders(
+        csv_file=config["csv_file"],
+        img_dir=config["img_dir"],
+        batch_size=config["batch_size"],
+        train_ratio=config["train_ratio"],
+        val_ratio=config["val_ratio"],
+        augment=config["augment"],
+        seed=config.get("seed", 42),
+        split_save_path=config.get("split_save_path"),
+        split_load_path=config.get("split_load_path"),
     )
-])
 
-# Transformations for test/validation (no augmentation)
-test_transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.4914, 0.4822, 0.4465],
-        std=[0.2470, 0.2435, 0.2616]
+    model = VisionTransformer(
+        img_size=32,
+        in_chans=3,
+        num_classes=10,
+        embed_dim=config["hidden_dim"],
+        depth=config["layers"],
+        num_heads=config["heads"],
+        mlp_ratio=config["mlp_ratio"],
+        dropout=config["dropout"],
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = make_optimizer(
+        model,
+        optimizer_name=config["optimizer"],
+        lr=config["lr"],
+        weight_decay=config["weight_decay"],
+        momentum=config.get("momentum", 0.9),
     )
-])
 
-num_epochs = 50
-batch_size = 32
-weight_decay = 0.1
-dropout_rate = 0.5
-attention_heads = 2
-layers = 2
-hidden_dimension = 32
-mlp_ratio = 2
+    total_steps = len(train_loader) * config["epochs"]
+    warmup_steps = int(0.3 * total_steps)
+    base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(total_steps - warmup_steps, 1),
+        eta_min=config.get("final_lr", 1e-5),
+    )
+    scheduler = GradualWarmupScheduler(
+        optimizer,
+        multiplier=1.0,
+        total_epoch=max(warmup_steps, 1),
+        after_scheduler=base_scheduler,
+    )
 
-init_lr = 1e-3
-final_lr = 1e-5
-warmup_epochs = 5
+    train_accs, val_accs = [], []
+    best_state = None
+    best_val_acc = -1.0
 
-# Load full dataset
-full_dataset = CustomImageDataset(
-    csv_file='train_labels.csv',
-    img_dir='train',
-    transform=None  # we will assign transforms later
-)
+    for epoch in range(config["epochs"]):
+        model.train()
+        correct, total = 0, 0
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
 
-# Split dataset
-train_size = int(0.7 * len(full_dataset))
-test_size = len(full_dataset) - train_size
-train_dataset, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, test_size])
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+        train_acc = correct / total
+        train_accs.append(train_acc)
 
-# Assign transforms to the subsets
-train_dataset.dataset.transform = train_transform
-test_dataset.dataset.transform = test_transform
+        model.eval()
+        val_correct, val_total = 0, 0
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs, labels = imgs.to(device), labels.to(device)
+                outputs = model(imgs)
+                _, predicted = outputs.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
+        val_acc = val_correct / val_total if val_total > 0 else 0.0
+        val_accs.append(val_acc)
 
-# Data loaders
-train_loader = DataLoader(train_dataset, batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size, shuffle=False)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state = copy.deepcopy(model.state_dict())
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-model = VisionTransformer(
-                            img_size=32, # input image size
-                            in_chans=3,  # input image channels, 3 for RGB
-                            num_classes=10, # number of output classes
-                            embed_dim=hidden_dimension, # embedding dimension
-                            depth=layers, # depth controls number of "n = loops" to do the transformer block
-                            num_heads=attention_heads, # number of attention heads
-                            mlp_ratio=mlp_ratio, # Controls hidden dimension of MLP as a multiple of embed_dim
-                            dropout=dropout_rate # dropout rate
-).to(device)
+        print(
+            f"[{config['label']}] Epoch {epoch+1}/{config['epochs']} "
+            f"- Train Acc: {train_acc:.4f} - Val Acc: {val_acc:.4f}"
+        )
 
-criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-
-# Optimizer
-optimizer = optim.AdamW(
-    model.parameters(),
-    lr=2e-3,
-    betas=(0.9, 0.999),
-    eps=1e-8,
-    weight_decay= weight_decay
-)
-
-# Cosine scheduler (will be wrapped by warmup)
-# Note: T_max is total steps after warmup
-total_steps = 78125
-warmup_steps = 21000
-# Cosine scheduler
-base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer,
-    T_max=total_steps - warmup_steps,
-    eta_min=final_lr
-)
-scheduler = GradualWarmupScheduler(
-    optimizer,
-    multiplier=1.0,
-    total_epoch=warmup_steps,  # warmup_steps in steps
-    after_scheduler=base_scheduler
-)
-train_accs = []
-test_accs = []
-global_step = 0
-for epoch in range(num_epochs):
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
-
-    for imgs, labels in train_loader:
-        imgs, labels = imgs.to(device), labels.to(device)
-
-        optimizer.zero_grad()
-        outputs = model(imgs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        scheduler.step()  # step **per batch**
-        global_step += 1
-
-        total_loss += loss.item() * imgs.size(0)
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-
-    train_loss = total_loss / total
-    train_acc = correct / total
-    train_accs.append(train_acc)
+    weights_path = f"VIT3_{config['label']}.pt"
+    torch.save(best_state if best_state is not None else model.state_dict(), weights_path)
+    # Evaluate best on test set
+    model.load_state_dict(best_state if best_state is not None else model.state_dict())
     model.eval()
-    test_correct = 0
-    test_total = 0
-
-    
+    test_correct, test_total = 0, 0
     with torch.no_grad():
         for imgs, labels in test_loader:
             imgs, labels = imgs.to(device), labels.to(device)
@@ -298,27 +368,43 @@ for epoch in range(num_epochs):
             _, predicted = outputs.max(1)
             test_total += labels.size(0)
             test_correct += predicted.eq(labels).sum().item()
-
     test_acc = test_correct / test_total
-    test_accs.append(train_acc)
+
+    metrics_path = f"VIT3_{config['label']}_metrics.pt"
+    torch.save({"train_acc": train_accs, "val_acc": val_accs, "test_acc": test_acc}, metrics_path)
     print(
-        f"Epoch {epoch+1}/{num_epochs} "
-        f"- Train Loss: {train_loss:.4f} "
-        f"- Train Acc: {train_acc:.4f} "
-        f"- Test Acc: {test_acc:.4f}"
+        f"[{config['label']}] Saved weights -> {weights_path}, metrics -> {metrics_path} "
+        f"(best val: {best_val_acc:.4f}, test: {test_acc:.4f})"
     )
 
-    
-# save metrics
-torch.save(
-    {
-        "train_acc": train_accs,
-        "val_acc": test_accs
-    },
-    "Vision_Transformer_Metrics.pt"
-)
-# %%
 
-# save the trained model weights
-torch.save(model.state_dict(), "VIT3_weights.pt")
-print("Saved Vision Transformer 3 weights as VIT3_weights.pt")
+if __name__ == "__main__":
+    # Train a new ViT on a simple 70/30 split (seed 42), same as ResNet now uses
+    experiments = [
+        {
+            "label": "vit3_resnet_split_sgd",
+            "batch_size": 32,
+            "weight_decay": 0.001,
+            "dropout": 0.5,
+            "heads": 2,
+            "layers": 2,
+            "hidden_dim": 128,
+            "mlp_ratio": 2,
+            "lr": 0.01,
+            "optimizer": "sgd",
+            "momentum": 0.9,
+            "epochs": 20,
+            "train_ratio": 0.7,
+            "val_ratio": 0.15,  # 70/15/15 split
+            "augment": True,
+            "csv_file": "train_labels.csv",
+            "img_dir": "train",
+            "seed": 42,
+            # Force a fresh split and save it; do not reuse an old split with no val set
+            "split_load_path": None,
+            "split_save_path": "vit3_resnet_split_sgd_split.pt",
+        },
+    ]
+
+    for exp in experiments:
+        train_one_vit(exp)

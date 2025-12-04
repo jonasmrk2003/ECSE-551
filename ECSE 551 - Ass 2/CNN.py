@@ -36,32 +36,36 @@ class CNN(nn.Module):
 
 
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-model = CNN(num_classes=10).to(device)
-criterion = nn.CrossEntropyLoss(label_smoothing=0.2)
+if __name__ == "__main__":
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = CNN(num_classes=10).to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.2)
 
-# Hyperparameters
-batch_size = 32
-weight_decay = 0.1
-num_epochs = 25
+    # Hyperparameters
+    batch_size = 32
+    weight_decay = 0.1
+    num_epochs = 25
 
-train_loader, test_loader = load_data(
-    dataset_class=CustomImageDataset,
-    csv_file='train_labels.csv',
-    img_dir='train',
-    batch_size=batch_size,
-    augment=True,
-    train_ratio=0.8,
-)
-# Optimizer
-optimizer = optim.AdamW(
-    model.parameters(),
-    lr=2e-3,
-    betas=(0.9, 0.999),
-    eps=1e-8,
-    weight_decay= weight_decay
-)
+    train_loader, test_loader = load_data(
+        dataset_class=CustomImageDataset,
+        csv_file='train_labels.csv',
+        img_dir='train',
+        batch_size=batch_size,
+        augment=True,
+        train_ratio=0.8,
+    )
+    # Optimizer
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=2e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay= weight_decay
+    )
 
-train_accs, test_accs, weights = train_model(
-    model, train_loader, test_loader, criterion, optimizer, device, num_epochs
-)
+    train_accs, test_accs, weights = train_model(
+        model, train_loader, test_loader, criterion, optimizer, device, num_epochs
+    )
+
+    torch.save(model.state_dict(), "CNN_2lay.pt")
+    print("Saved CNN weights to CNN_2lay.pt")

@@ -5,6 +5,7 @@ from PIL import Image
 import pandas as pd
 import torch
 import time
+import copy
 
 class CustomImageDataset(Dataset):
     def __init__(self, csv_file, img_dir, transform=None):
@@ -136,10 +137,12 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, device, 
     Train a PyTorch model and track train/test accuracy.
 
     Returns:
-        train_accs, test_accs, model_weights: Lists of accuracy per epoch and trained weights
+        train_accs, test_accs, model_weights: Lists of accuracy per epoch and best test-time weights
     """
     train_accs, test_accs = [], []
     global_step = 0
+    best_test_acc = -1.0
+    best_state = None
 
     for epoch in range(num_epochs):
         start_time = time.time()  # start timer
@@ -182,6 +185,11 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, device, 
         test_acc = test_correct / test_total
         test_accs.append(test_acc)
 
+        # Track best model on test set
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            best_state = copy.deepcopy(model.state_dict())
+
         print(
             f"Epoch {epoch+1}/{num_epochs} "
             f"- Train Loss: {train_loss:.4f} "
@@ -191,7 +199,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, device, 
         )
 
     # Return accuracies and final trained weights
-    return train_accs, test_accs, model.state_dict()
+    return train_accs, test_accs, best_state if best_state is not None else model.state_dict()
 
 
 import numpy as np
@@ -218,6 +226,8 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 def train_model_mixup(model, train_loader, test_loader, criterion, optimizer, device, num_epochs, mixup_alpha=0.2):
     train_accs, test_accs = [], []
     global_step = 0
+    best_test_acc = -1.0
+    best_state = None
 
     for epoch in range(num_epochs):
         start_time = time.time()
@@ -264,6 +274,11 @@ def train_model_mixup(model, train_loader, test_loader, criterion, optimizer, de
         test_acc = test_correct / test_total
         test_accs.append(test_acc)
 
+        # Track best model on test set
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            best_state = copy.deepcopy(model.state_dict())
+
         end_time = time.time()
         epoch_time = end_time - start_time
 
@@ -275,4 +290,4 @@ def train_model_mixup(model, train_loader, test_loader, criterion, optimizer, de
             f"- Time: {epoch_time:.2f} sec"
         )
 
-    return train_accs, test_accs, model.state_dict()
+    return train_accs, test_accs, best_state if best_state is not None else model.state_dict()

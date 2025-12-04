@@ -1,0 +1,571 @@
+import argparse
+import glob
+import numpy as np
+import torch
+from pathlib import Path
+from torch.utils.data import DataLoader
+from sklearn.metrics import confusion_matrix, classification_report
+
+from helper_functions import CustomImageDataset, get_cifar10_transforms
+
+SWEEP_DIR = Path("HyperParameter sweep")
+from ResNET import ResNet_32, ResNET_Block
+from CNN import CNN
+from Vision_Transformer3 import VisionTransformer, build_transforms
+
+
+def build_model(model_name: str):
+    model_name = model_name.lower()
+    if model_name == "resnet32":
+        model = ResNet_32(ResNET_Block, [1, 1, 1, 1], num_classes=10)
+        default_weights = "ResNet32.pt"
+        _, eval_transform = get_cifar10_transforms(augment=False)
+    elif model_name == "cnn":
+        model = CNN(num_classes=10)
+        default_weights = "CNN.pt"
+        _, eval_transform = get_cifar10_transforms(augment=False)
+    elif model_name == "vit3":  # Vision Transformer v3
+        model = VisionTransformer(
+            img_size=32,
+            in_chans=3,
+            num_classes=10,
+            embed_dim=32,
+            depth=2,
+            num_heads=2,
+            mlp_ratio=2,
+            dropout=0.5,
+        )
+        default_weights = SWEEP_DIR / "VIT3_weights.pt" if SWEEP_DIR.exists() else "VIT3_weights.pt"
+        _, eval_transform = build_transforms(augment=False)
+    elif model_name == "vit3_noaug":  # Vision Transformer v3 trained without augmentation
+        model = VisionTransformer(
+            img_size=32,
+            in_chans=3,
+            num_classes=10,
+            embed_dim=32,
+            depth=2,
+            num_heads=2,
+            mlp_ratio=2,
+            dropout=0.5,
+        )
+        default_weights = SWEEP_DIR / "VIT3_weights_NoAugment.pt" if SWEEP_DIR.exists() else "VIT3_weights_NoAugment.pt"
+        _, eval_transform = build_transforms(augment=False)
+    elif model_name == "vit3_adamw_base":
+        model = VisionTransformer(
+            img_size=32,
+            in_chans=3,
+            num_classes=10,
+            embed_dim=32,
+            depth=2,
+            num_heads=2,
+            mlp_ratio=2,
+            dropout=0.5,
+        )
+        default_weights = SWEEP_DIR / "VIT3_vit3_adamw_base.pt" if SWEEP_DIR.exists() else "VIT3_vit3_adamw_base.pt"
+        _, eval_transform = build_transforms(augment=False)
+    elif model_name == "vit3_sgd_hid128_best":
+        model = VisionTransformer(
+            img_size=32,
+            in_chans=3,
+            num_classes=10,
+            embed_dim=128,
+            depth=2,
+            num_heads=2,
+            mlp_ratio=2,
+            dropout=0.5,
+        )
+        default_weights = SWEEP_DIR / "VIT3_vit3_sgd_hid128_best.pt" if SWEEP_DIR.exists() else "VIT3_vit3_sgd_hid128_best.pt"
+        _, eval_transform = build_transforms(augment=False)
+    elif model_name == "resnet9":
+        model = ResNet_32(ResNET_Block, [1, 1, 1, 1], num_classes=10)
+        default_weights = "ResNet9.pt"
+        _, eval_transform = get_cifar10_transforms(augment=False)
+    elif model_name == "vit3_resnet_split_sgd":
+        model = VisionTransformer(
+            img_size=32,
+            in_chans=3,
+            num_classes=10,
+            embed_dim=128,
+            depth=2,
+            num_heads=2,
+            mlp_ratio=2,
+            dropout=0.5,
+        )
+        default_weights = "VIT3_vit3_resnet_split_sgd.pt"
+        _, eval_transform = build_transforms(augment=False)
+    else:
+        raise ValueError(f"Unknown model '{model_name}'")
+    return model, default_weights, eval_transform
+
+
+def run_eval(
+    model_name: str,
+    csv_file: str,
+    img_dir: str,
+    batch_size: int,
+    force_cpu: bool,
+    weights_override: str | None,
+    save_cm: str | None,
+    test_indices: list[int] | None,
+):
+    model, default_weights, eval_transform = build_model(model_name)
+    weights_path = weights_override or default_weights
+
+    device = "cuda" if torch.cuda.is_available() and not force_cpu else "cpu"
+
+    state_dict = torch.load(weights_path, map_location=device)
+    model.load_state_dict(state_dict)
+    model.to(device).eval()
+
+    dataset = CustomImageDataset(csv_file=csv_file, img_dir=img_dir, transform=eval_transform)
+    if test_indices is not None:
+        dataset = torch.utils.data.Subset(dataset, test_indices)
+        # propagate classes from underlying dataset
+        dataset.classes = dataset.dataset.classes
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    all_labels, all_preds = [], []
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs = imgs.to(device)
+            outputs = model(imgs)
+            preds = outputs.argmax(dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+
+    all_labels = np.array(all_labels)
+    all_preds = np.array(all_preds)
+
+    # cm = confusion_matrix(all_labels, all_preds)
+    # print(f"\n=== {model_name.upper()} ===")
+    # print("Confusion matrix:\n", cm)
+    # print("\nClassification report:\n", classification_report(all_labels, all_preds, target_names=dataset.classes))
+
+    # if save_cm:
+    #     np.savetxt(save_cm, cm.astype(int), fmt="%d", delimiter=",")
+    #     print(f"Saved confusion matrix to {save_cm}")
+
+    eval_acc = float((all_preds == all_labels).mean())
+    return all_labels, all_preds, dataset.classes, eval_acc
+
+
+def contingency_between(preds_a, preds_b, labels):
+    """
+    Contingency table between two models' predictions.
+    Rows: model A preds, Cols: model B preds.
+    """
+    num_classes = max(preds_a.max(), preds_b.max()) + 1
+    table = np.zeros((num_classes, num_classes), dtype=int)
+    for pa, pb in zip(preds_a, preds_b):
+        table[pa, pb] += 1
+    return table
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Evaluate one or more models and produce confusion/contingency matrices"
+    )
+    parser.add_argument(
+        "--models",
+        default="resnet32,resnet9,vit3,vit3_noaug,cnn,vit3_adamw_base,vit3_sgd_hid128_best,vit3_resnet_split_sgd",
+        help="Comma-separated list from {resnet32,resnet9,cnn,vit3,vit3_noaug,vit3_adamw_base,vit3_sgd_hid128_best,vit3_resnet_split_sgd}.",
+    )
+    parser.add_argument(
+        "--weights",
+        default=None,
+        help="Optional weights path applied to all models (otherwise defaults per model)",
+    )
+    parser.add_argument("--csv", default="train_labels.csv", help="CSV with filenames and labels")
+    parser.add_argument("--img-dir", default="train", help="Image directory matching the CSV")
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available")
+    parser.add_argument(
+        "--save-cm",
+        default=None,
+        help="Optional path to save confusion matrix for each model; model name will be appended before extension",
+    )
+    parser.add_argument("--train-ratio", type=float, default=0.7, help="Fraction for train split (rest used for test eval)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for splitting (shared across models)")
+    args = parser.parse_args()
+
+    model_list = [m.strip().lower() for m in args.models.split(",") if m.strip()]
+    results = {}
+
+    # Model-specific train ratios to mirror training scripts
+    model_train_ratio = {
+        "resnet32": 0.7,
+        "resnet9": 0.7,
+        "vit3": 0.7,
+        "vit3_noaug": 0.7,
+        "cnn": 0.8,
+        "vit3_adamw_base": 0.7,
+        "vit3_sgd_hid128_best": 0.7,
+        "vit3_resnet_split_sgd": 0.7,
+    }
+    # Model-specific seeds to mirror training; fallback to CLI seed
+    model_seed = {
+        "resnet32": args.seed,
+        "resnet9": 42,
+        "vit3": 42,         # matches Vision_Transformer3 training default
+        "vit3_noaug": 42,   # same split as vit3
+        "cnn": args.seed,
+        "vit3_adamw_base": 42,
+        "vit3_sgd_hid128_best": 42,
+        "vit3_resnet_split_sgd": 42,
+    }
+    # Optional per-model saved split files (contains test indices). If present, overrides random split.
+    split_base = SWEEP_DIR if SWEEP_DIR.exists() else Path(".")
+    split_files = {
+        "vit3": split_base / "vit3_split.pt",
+        "vit3_noaug": split_base / "vit3_noaug_split.pt",
+        "vit3_adamw_base": split_base / "vit3_adamw_split.pt",
+        "vit3_sgd_hid128_best": split_base / "vit3_sgd_hid128_split.pt",
+        "vit3_resnet_split_sgd": split_base / "vit3_resnet_split_sgd_split.pt",
+        "resnet9": split_base / "vit3_resnet_split_sgd_split.pt",
+    }
+    base_dataset = CustomImageDataset(csv_file=args.csv, img_dir=args.img_dir, transform=None)
+
+    for model_name in model_list:
+        save_cm_path = None
+        if args.save_cm:
+            if "." in args.save_cm:
+                stem, ext = args.save_cm.rsplit(".", 1)
+                save_cm_path = f"{stem}_{model_name}.{ext}"
+            else:
+                save_cm_path = f"{args.save_cm}_{model_name}"
+        ratio = model_train_ratio.get(model_name, args.train_ratio)
+        test_indices = None
+        split_path = split_files.get(model_name)
+        if split_path and Path(split_path).exists():
+            loaded = torch.load(split_path, map_location="cpu")
+            # allow saved tensor/list or dict with "test_indices"
+            if isinstance(loaded, dict) and "test_indices" in loaded:
+                test_indices = loaded["test_indices"]
+            else:
+                test_indices = loaded
+        if test_indices is None:
+            seed = model_seed.get(model_name, args.seed)
+            train_size = int(ratio * len(base_dataset))
+            test_size = len(base_dataset) - train_size
+            generator = torch.Generator().manual_seed(seed)
+            _, test_subset = torch.utils.data.random_split(base_dataset, [train_size, test_size], generator=generator)
+            test_indices = test_subset.indices
+
+        labels, preds, classes, eval_acc = run_eval(
+            model_name=model_name,
+            csv_file=args.csv,
+            img_dir=args.img_dir,
+            batch_size=args.batch_size,
+            force_cpu=args.cpu,
+            weights_override=args.weights,
+            save_cm=save_cm_path,
+            test_indices=test_indices,
+        )
+        results[model_name] = {"labels": labels, "preds": preds, "classes": classes, "eval_acc": eval_acc}
+
+    # Contingency matrix between ResNet32 and ViT3 if both were evaluated
+    if "resnet32" in results and "vit3" in results:
+        print("\n=== CONTINGENCY: RESNET32 vs VIT3 (predictions vs predictions) ===")
+        cont = contingency_between(results["resnet32"]["preds"], results["vit3"]["preds"], results["resnet32"]["labels"])
+        print(cont)
+
+    # 2x2 contingency on correctness: ViT3 (aug) vs ViT3 (no augment)
+    if "vit3" in results and "vit3_noaug" in results:
+        labels = results["vit3"]["labels"]
+        preds_aug = results["vit3"]["preds"]
+        preds_noaug = results["vit3_noaug"]["preds"]
+
+        correct_aug = preds_aug == labels
+        correct_noaug = preds_noaug == labels
+
+        # Rows: ViT3 aug correctness (0=wrong,1=right); Cols: ViT3 no-aug correctness
+        cont2x2 = np.zeros((2, 2), dtype=int)
+        for ca, cna in zip(correct_aug, correct_noaug):
+            cont2x2[int(ca), int(cna)] += 1
+
+        print("\n=== 2x2 CONTINGENCY: CORRECTNESS (ViT3 aug vs ViT3 no-aug) ===")
+        print("Rows = ViT3 aug (0=wrong,1=right), Cols = ViT3 no-aug (0=wrong,1=right)")
+        print(cont2x2)
+
+    # 2x2 contingency on correctness: CNN vs ViT baseline
+    if "cnn" in results and "vit3" in results:
+        labels = results["vit3"]["labels"]
+        preds_vit = results["vit3"]["preds"]
+        preds_cnn = results["cnn"]["preds"]
+        min_len = min(len(preds_vit), len(preds_cnn), len(labels))
+        if min_len > 0:
+            preds_vit = preds_vit[:min_len]
+            preds_cnn = preds_cnn[:min_len]
+            labels = labels[:min_len]
+            correct_vit = preds_vit == labels
+            correct_cnn = preds_cnn == labels
+
+            cont2x2 = np.zeros((2, 2), dtype=int)
+            for cv, cc in zip(correct_vit, correct_cnn):
+                cont2x2[int(cv), int(cc)] += 1
+
+            print("\n=== 2x2 CONTINGENCY: CORRECTNESS (ViT baseline vs CNN) ===")
+            print("Rows = ViT (0=wrong,1=right), Cols = CNN (0=wrong,1=right)")
+            print(cont2x2)
+        else:
+            print("\n[WARN] Skipping ViT vs CNN contingency: no overlapping samples.")
+
+    # 2x2 contingency on correctness: ResNet32 vs new ViT (trained on same split)
+    if "resnet32" in results and "vit3_resnet_split_sgd" in results:
+        labels_vit = results["vit3_resnet_split_sgd"]["labels"]
+        labels_res = results["resnet32"]["labels"]
+        preds_vit = results["vit3_resnet_split_sgd"]["preds"]
+        preds_res = results["resnet32"]["preds"]
+        if len(labels_vit) == len(labels_res) == len(preds_vit) == len(preds_res):
+            correct_vit = preds_vit == labels_vit
+            correct_res = preds_res == labels_res
+
+            cont2x2 = np.zeros((2, 2), dtype=int)
+            for cv, cr in zip(correct_vit, correct_res):
+                cont2x2[int(cv), int(cr)] += 1
+
+            print("\n=== 2x2 CONTINGENCY: CORRECTNESS (ViT on ResNet split vs ResNet32) ===")
+            print("Rows = ViT (0=wrong,1=right), Cols = ResNet32 (0=wrong,1=right)")
+            print(cont2x2)
+        else:
+            print(f"\n[WARN] Skipping ViT vs ResNet32 contingency: length mismatch vit={len(preds_vit)}, resnet={len(preds_res)}, labels_vit={len(labels_vit)}, labels_res={len(labels_res)}")
+
+    # 2x2 contingency on correctness: ResNet9 vs ViT on same split
+    if "resnet9" in results and "vit3_resnet_split_sgd" in results:
+        labels_vit = results["vit3_resnet_split_sgd"]["labels"]
+        labels_res = results["resnet9"]["labels"]
+        preds_vit = results["vit3_resnet_split_sgd"]["preds"]
+        preds_res = results["resnet9"]["preds"]
+        if len(labels_vit) == len(labels_res) == len(preds_vit) == len(preds_res):
+            correct_vit = preds_vit == labels_vit
+            correct_res = preds_res == labels_res
+
+            cont2x2 = np.zeros((2, 2), dtype=int)
+            for cv, cr in zip(correct_vit, correct_res):
+                cont2x2[int(cv), int(cr)] += 1
+
+            print("\n=== 2x2 CONTINGENCY: CORRECTNESS (ViT vs ResNet9) ===")
+            print("Rows = ViT (0=wrong,1=right), Cols = ResNet9 (0=wrong,1=right)")
+            print(cont2x2)
+        else:
+            print(f"\n[WARN] Skipping ViT vs ResNet9 contingency: length mismatch vit={len(preds_vit)}, resnet9={len(preds_res)}, labels_vit={len(labels_vit)}, labels_res={len(labels_res)}")
+
+    # Per-class correct/incorrect comparison table between preferred ViT and ResNet
+    vit_key = "vit3_resnet_split_sgd" if "vit3_resnet_split_sgd" in results else "vit3"
+    res_key = "resnet9" if "resnet9" in results else ("resnet32" if "resnet32" in results else None)
+    if vit_key in results and res_key in results:
+        labels_vit = results[vit_key]["labels"]
+        labels_res = results[res_key]["labels"]
+        preds_vit = results[vit_key]["preds"]
+        preds_res = results[res_key]["preds"]
+        classes = results[vit_key]["classes"]
+
+        # Align lengths if needed
+        min_len = min(len(labels_vit), len(labels_res), len(preds_vit), len(preds_res))
+        labels_vit = labels_vit[:min_len]
+        labels_res = labels_res[:min_len]
+        preds_vit = preds_vit[:min_len]
+        preds_res = preds_res[:min_len]
+
+        print(f"\n=== Per-class correctness: {vit_key} vs {res_key} ===")
+        header = f"{'Class':15} {'ViT Correct':12} {'ViT Wrong':10} {'Res Correct':12} {'Res Wrong':10} {'Verdict'}"
+        print(header)
+        for cls_idx, cls_name in enumerate(classes):
+            cls_mask = labels_vit == cls_idx
+            total_cls = cls_mask.sum()
+            if total_cls == 0:
+                continue
+            vit_correct = int((preds_vit[cls_mask] == labels_vit[cls_mask]).sum())
+            res_correct = int((preds_res[cls_mask] == labels_res[cls_mask]).sum())
+            vit_wrong = total_cls - vit_correct
+            res_wrong = total_cls - res_correct
+            if vit_correct > res_correct:
+                verdict = "ViT better"
+            elif res_correct > vit_correct:
+                verdict = "ResNet better"
+            else:
+                verdict = "Tie"
+            print(f"{cls_name:15} {vit_correct:12} {vit_wrong:10} {res_correct:12} {res_wrong:10} {verdict}")
+    # Summary table similar to paper-style: Model, Type, Train Acc, Test Acc
+    model_type_map = {
+        "cnn": "CNN",
+        "resnet32": "ResNet",
+        "resnet9": "ResNet",
+        "vit3": "ViT",
+        "vit3_noaug": "ViT",
+        "vit3_adamw_base": "ViT",
+        "vit3_sgd_hid128_best": "ViT",
+        "vit3_resnet_split_sgd": "ViT",
+    }
+    summary_rows = []
+    for m_name, res in results.items():
+        summary_rows.append({
+            "model": m_name,
+            "type": model_type_map.get(m_name, "N/A"),
+            # We only compute eval (test) acc here; no separate train acc in this script
+            "train_acc": "-",  # placeholder
+            "test_acc": res["eval_acc"],
+        })
+    if summary_rows:
+        # Pretty print
+        print("\n=== SUMMARY TABLE ===")
+        print(f"{'Model':15} {'Type':10} {'Train Acc':10} {'Test Acc':10}")
+        for row in summary_rows:
+            print(f"{row['model']:15} {row['type']:10} {row['train_acc']:10} {row['test_acc']:.4f}")
+
+    # Direct accuracy comparison: ViT with augmentation vs without
+    if "vit3" in results and "vit3_noaug" in results:
+        acc_aug = results["vit3"]["eval_acc"]
+        acc_noaug = results["vit3_noaug"]["eval_acc"]
+        print("\n=== ViT Aug vs No-Aug (Test Acc) ===")
+        print(f"{'ViT (aug)':15} {acc_aug:.4f}")
+        print(f"{'ViT (no-aug)':15} {acc_noaug:.4f}")
+
+    # ViT3 sweep comparison table from saved metrics
+    def load_best_val_acc(pt_path):
+        data = torch.load(pt_path, map_location="cpu")
+        vals = data.get("val_acc", [])
+        return float(max(vals)) if len(vals) > 0 else float("nan")
+
+    sweep_dir = SWEEP_DIR
+    vit_files = glob.glob(str(sweep_dir / "VIT3_*metrics.pt")) if sweep_dir.exists() else glob.glob("VIT3_*metrics.pt")
+    if vit_files:
+        baseline_acc = None
+        baseline_sgd = None
+        results_adamw = {}
+        results_sgd = {}
+        for f in vit_files:
+            name = Path(f).stem  # strip .pt
+            label = name.replace("VIT3_", "")
+            parts = label.split("_")
+            # Handle prefixes like vit3_sgd_base_bs_up_metrics
+            if parts and parts[0] == "vit3":
+                parts = parts[1:]
+            if parts and parts[-1] == "metrics":
+                parts = parts[:-1]
+            if len(parts) < 2:
+                continue
+            optimizer = parts[0]
+            best_acc = load_best_val_acc(f)
+            if optimizer == "adamw":
+                if parts[1] == "base" and len(parts) == 2:
+                    baseline_acc = best_acc
+                    continue
+                if len(parts) < 4:
+                    continue
+                param_token = parts[2]
+                direction = parts[3]  # up/dn/...
+                key = (param_token, direction)
+                results_adamw[key] = best_acc
+            elif optimizer == "sgd":
+                if parts[1] == "base" and len(parts) == 2:
+                    baseline_sgd = best_acc
+                    continue
+                if len(parts) < 4:
+                    continue
+                param_token = parts[2]
+                direction = parts[3]
+                key = (param_token, direction)
+                results_sgd[key] = best_acc
+
+        token_to_name = {
+            "bs": "batch_size",
+            "wd": "weight_decay",
+            "drop": "dropout",
+            "heads": "attention_heads",
+            "layers": "layers",
+            "hid": "hidden_dim",
+            "mlp": "mlp_ratio",
+            "lr": "learning_rate",
+        }
+        params_order = ["bs", "wd", "drop", "heads", "layers", "hid", "mlp", "lr"]
+
+        def print_sweep_table(title, baseline, resmap):
+            print(f"\n=== {title} (Val Acc) ===")
+            print(f"{'Param':20} {'Base':10} {'Up':10} {'Down':10}")
+            for tok in params_order:
+                base = f"{baseline:.4f}" if baseline is not None else "-"
+                up = resmap.get((tok, "up"))
+                dn = resmap.get((tok, "dn"))
+                up_s = f"{up:.4f}" if up is not None else "-"
+                dn_s = f"{dn:.4f}" if dn is not None else "-"
+                print(f"{token_to_name.get(tok, tok):20} {base:10} {up_s:10} {dn_s:10}")
+
+        if baseline_acc is not None or results_adamw:
+            print_sweep_table("ViT3 (AdamW) Sweep Summary", baseline_acc, results_adamw)
+
+        if baseline_sgd is not None or results_sgd:
+            print_sweep_table("ViT3 (SGD) Sweep Summary", baseline_sgd, results_sgd)
+
+        # Best variants highlight
+        if results_adamw:
+            best_key, best_val = max(results_adamw.items(), key=lambda kv: kv[1])
+            print(f"\nBest AdamW variant: {best_key[0]}_{best_key[1]} -> {best_val:.4f}")
+        if results_sgd:
+            best_key, best_val = max(results_sgd.items(), key=lambda kv: kv[1])
+            print(f"Best SGD variant: {best_key[0]}_{best_key[1]} -> {best_val:.4f}")
+
+            # Reconstruct hyperparameters for the best SGD variant (from the sweep rules)
+            base_cfg = {
+                "batch_size": 32,
+                "weight_decay": 0.001,
+                "dropout": 0.5,
+                "heads": 2,
+                "layers": 2,
+                "hidden_dim": 64,
+                "mlp_ratio": 2,
+                "lr": 0.01,
+                "optimizer": "sgd",
+                "momentum": 0.9,
+                "epochs": 20,
+                "train_ratio": 0.7,
+                "augment": True,
+                "seed": 42,
+            }
+
+            def pick_heads_up(hidden_dim, heads):
+                for h in range(heads + 1, max(hidden_dim, heads + 2)):
+                    if hidden_dim % h == 0:
+                        return h
+                return heads
+
+            def pick_heads_dn(hidden_dim, heads):
+                for h in range(heads - 1, 0, -1):
+                    if hidden_dim % h == 0:
+                        return h
+                return heads
+
+            param_token, direction = best_key
+            cfg = base_cfg.copy()
+            if param_token == "bs":
+                cfg["batch_size"] = max(1, cfg["batch_size"] * (2 if direction == "up" else 0.5))
+            elif param_token == "wd":
+                cfg["weight_decay"] = cfg["weight_decay"] * (10 if direction == "up" else 0.1)
+            elif param_token == "drop":
+                cfg["dropout"] = min(0.9, max(0.0, cfg["dropout"] + (0.1 if direction == "up" else -0.1)))
+            elif param_token == "heads":
+                cfg["heads"] = pick_heads_up(cfg["hidden_dim"], cfg["heads"]) if direction == "up" else pick_heads_dn(cfg["hidden_dim"], cfg["heads"])
+            elif param_token == "layers":
+                cfg["layers"] = cfg["layers"] + 1 if direction == "up" else max(1, cfg["layers"] - 1)
+            elif param_token == "hid":
+                cfg["hidden_dim"] = cfg["hidden_dim"] * 2 if direction == "up" else max(8, cfg["hidden_dim"] // 2)
+                # adjust heads if needed for divisibility
+                if cfg["hidden_dim"] % cfg["heads"] != 0:
+                    cfg["heads"] = pick_heads_dn(cfg["hidden_dim"], cfg["heads"])
+            elif param_token == "mlp":
+                cfg["mlp_ratio"] = max(1.0, cfg["mlp_ratio"] * (1.5 if direction == "up" else 0.75))
+            elif param_token == "lr":
+                cfg["lr"] = cfg["lr"] * (2 if direction == "up" else 0.5)
+
+            print("Best SGD hyperparameters (reconstructed):")
+            for k in ["batch_size", "weight_decay", "dropout", "heads", "layers", "hidden_dim", "mlp_ratio", "lr", "momentum", "epochs", "train_ratio", "augment", "seed"]:
+                print(f"  {k}: {cfg[k]}")
+
+        # AdamW vs SGD baseline comparison
+        if baseline_acc is not None or baseline_sgd is not None:
+            print("\n=== ViT3 Baseline Optimizer Comparison (Val Acc) ===")
+            print(f"{'Optimizer':15} {'Val Acc':10}")
+            if baseline_acc is not None:
+                print(f"{'AdamW':15} {baseline_acc:.4f}")
+            if baseline_sgd is not None:
+                print(f"{'SGD':15} {baseline_sgd:.4f}")

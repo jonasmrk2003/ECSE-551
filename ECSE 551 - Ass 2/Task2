@@ -1,0 +1,325 @@
+# %% CIFAR10-style Boosting (AdaBoost-SAMME) with your CSV/directory setup
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision import transforms
+
+
+# -----------------------------
+# Your dataset & transforms
+# -----------------------------
+class CustomImageDataset(Dataset):
+    def __init__(self, csv_file, img_dir, transform=None):
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+
+        # Map string labels to integers
+        self.classes = sorted(self.data["label"].unique())
+        self.class_to_idx = {cls: idx for idx, cls in enumerate(self.classes)}
+        self.data["label_idx"] = self.data["label"].map(self.class_to_idx)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        img_name = f"{self.img_dir}/{self.data.iloc[idx, 0]}"
+        image = Image.open(img_name).convert("RGB")
+        label = int(self.data.iloc[idx]["label_idx"])
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+def build_transforms():
+    # You can tweak this to match your ViT pipeline
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.TrivialAugmentWide(),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.4914, 0.4822, 0.4465],
+            std=[0.2470, 0.2435, 0.2616],
+        ),
+    ])
+
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.4914, 0.4822, 0.4465],
+            std=[0.2470, 0.2435, 0.2616],
+        ),
+    ])
+    return train_transform, test_transform
+
+
+# -----------------------------
+# Weak learner: small CNN
+# -----------------------------
+class SmallCIFAR10CNN(nn.Module):
+    """
+    A tiny CNN used as weak learner.
+    Feel free to shrink / enlarge it.
+    """
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),   # 32 -> 16
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),   # 16 -> 8
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),  # [B, 128, 1, 1]
+        )
+        self.classifier = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        return self.classifier(x)
+
+
+# -----------------------------
+# Train a single weak learner with weighted sampling
+# -----------------------------
+def train_weak_learner(model, dataset, sample_weights, batch_size, epochs, device):
+    """
+    model        : SmallCIFAR10CNN
+    dataset      : CustomImageDataset (with train transform)
+    sample_weights: numpy array shape (N,)
+    """
+    model.to(device)
+
+    # Weighted sampler according to current AdaBoost weights
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(dataset),
+        replacement=True,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0005)
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        correct, total = 0, 0
+
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * labels.size(0)
+            _, preds = outputs.max(1)
+            total += labels.size(0)
+            correct += preds.eq(labels).sum().item()
+
+        train_loss = running_loss / total
+        train_acc = correct / total
+        print(f"  Epoch {epoch+1}/{epochs} - loss {train_loss:.4f}, acc {train_acc:.4f}")
+
+    return model
+
+
+# -----------------------------
+# Evaluate model on entire training set
+# -----------------------------
+def predict_on_dataset(model, dataset, batch_size, device):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    model.eval()
+    preds = []
+
+    with torch.no_grad():
+        for imgs, _ in loader:
+            imgs = imgs.to(device)
+            outputs = model(imgs)
+            batch_preds = outputs.argmax(dim=1).cpu().numpy()
+            preds.append(batch_preds)
+
+    preds = np.concatenate(preds, axis=0)
+    return preds
+
+
+# -----------------------------
+# AdaBoost-SAMME for CIFAR10-style dataset
+# -----------------------------
+def adaboost_cifar10(
+    csv_file="train_labels.csv",
+    img_dir="train",
+    num_classes=10,
+    num_learners=5,
+    epochs_per_learner=3,
+    batch_size=64,
+):
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    train_t, _ = build_transforms()
+    dataset = CustomImageDataset(csv_file=csv_file, img_dir=img_dir, transform=train_t)
+
+    N = len(dataset)
+    y = np.array(dataset.data["label_idx"], dtype=np.int64)
+
+    # Initialize uniform weights
+    w = np.ones(N, dtype=np.float64) / N
+
+    models = []
+    alphas = []
+
+    for m in range(num_learners):
+        print(f"\n=== Weak learner {m+1}/{num_learners} ===")
+
+        # 1) Train weak learner with current weights
+        model = SmallCIFAR10CNN(num_classes=num_classes)
+        model = train_weak_learner(
+            model=model,
+            dataset=dataset,
+            sample_weights=w,
+            batch_size=batch_size,
+            epochs=epochs_per_learner,
+            device=device,
+        )
+
+        # 2) Get predictions on full training set
+        preds = predict_on_dataset(
+            model=model,
+            dataset=dataset,
+            batch_size=batch_size,
+            device=device,
+        )
+
+        # 3) Compute weighted error (SAMME for multi-class)
+        misclassified = (preds != y).astype(np.float64)
+        eps = np.sum(w * misclassified) / np.sum(w)
+        eps = np.clip(eps, 1e-10, 1 - 1e-10)  # avoid division by 0
+
+        # SAMME alpha
+        alpha = np.log((1.0 - eps) / eps) + np.log(num_classes - 1)
+        print(f"  Weighted error = {eps:.4f}, alpha = {alpha:.4f}")
+
+        # 4) Update weights: increase weight on misclassified samples
+        w *= np.exp(alpha * misclassified)
+        w /= np.sum(w)
+
+        models.append(model.state_dict())
+        alphas.append(alpha)
+
+    # Save ensemble
+    torch.save(
+        {
+            "models": models,
+            "alphas": alphas,
+            "class_to_idx": dataset.class_to_idx,
+        },
+        "cifar10_adaboost_ensemble.pt",
+    )
+    print("\nSaved AdaBoost ensemble to cifar10_adaboost_ensemble.pt")
+
+    return models, alphas, dataset.class_to_idx
+
+
+# -----------------------------
+# Prediction with the ensemble
+# -----------------------------
+def load_ensemble_and_predict(ensemble_path, csv_file, img_dir, batch_size=64):
+    """
+    Example function to load ensemble and predict on *any* dataset
+    with the same CSV/image structure.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    saved = torch.load(ensemble_path, map_location=device)
+    state_dicts = saved["models"]
+    alphas = saved["alphas"]
+    class_to_idx = saved["class_to_idx"]
+    num_classes = len(class_to_idx)
+
+    _, test_t = build_transforms()
+    dataset = CustomImageDataset(csv_file=csv_file, img_dir=img_dir, transform=test_t)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    # Rebuild models
+    weak_learners = []
+    for sd in state_dicts:
+        m = SmallCIFAR10CNN(num_classes=num_classes).to(device)
+        m.load_state_dict(sd)
+        m.eval()
+        weak_learners.append(m)
+
+    all_scores = []
+    with torch.no_grad():
+        for imgs, _ in loader:
+            imgs = imgs.to(device)
+            # scores: [batch, num_classes]
+            scores = torch.zeros(imgs.size(0), num_classes, device=device)
+
+            for alpha, m in zip(alphas, weak_learners):
+                outputs = m(imgs)                 # [B, num_classes]
+                preds = outputs.argmax(dim=1)     # [B]
+                # add alpha to predicted class score
+                scores.scatter_add_(
+                    dim=1,
+                    index=preds.unsqueeze(1),
+                    src=torch.full_like(preds.unsqueeze(1), fill_value=alpha, dtype=torch.float),
+                )
+
+            final_preds = scores.argmax(dim=1)  # [B]
+            all_scores.append(final_preds.cpu().numpy())
+
+    all_preds = np.concatenate(all_scores, axis=0)
+    return all_preds, class_to_idx
+
+
+# -----------------------------
+# Example usage
+# -----------------------------
+if __name__ == "__main__":
+    # Train ensemble on your training set
+    adaboost_cifar10(
+        csv_file="train_labels.csv",
+        img_dir="train",
+        num_classes=10,
+        num_learners=5,         # increase to 10–20 if you have GPU time
+        epochs_per_learner=3,   # increase for stronger learners
+        batch_size=64,
+    )
+
+    # Later, to predict on a (csv, img_dir) pair (e.g., your Kaggle test set),
+    # you can call:
+    #
+    # preds, class_to_idx = load_ensemble_and_predict(
+    #     "cifar10_adaboost_ensemble.pt",
+    #     csv_file="test_labels_like.csv",   # or a dummy csv without labels if you only need filenames
+    #     img_dir="test",
+    # )
